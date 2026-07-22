@@ -1,0 +1,53 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+
+    "AZURE_LANGUAGE_ENDPOINT": "https://<your-language-resource>.cognitiveservices.azure.com",
+    "AZURE_LANGUAGE_API_VERSION": "2023-04-01",
+
+    "CONTENT_SAFETY_ENDPOINT": "https://<your-content-safety-resource>.cognitiveservices.azure.com",
+    "CONTENT_SAFETY_API_VERSION": "2024-09-01",
+
+    "PURVIEW_ACCOUNT_ENDPOINT": "https://<your-purview-account>.purview.azure.com",
+    "GRAPH_ENDPOINT": "https://graph.microsoft.com",
+    "STORAGE_ACCOUNT_URL": "https://<your-storage-account>.blob.core.windows.net",
+
+    "POLICY_VERSION": "2026-07-01",
+    "FAIL_MODE": "fail_closed",
+    "DEFAULT_ACTION_ON_ERROR": "Review",
+
+    "MAX_PROMPT_CHARS": "50000",
+    "MAX_CHUNK_CHARS": "5000",
+    "CHUNK_OVERLAP_CHARS": "200",
+    "MAX_FILE_BYTES": "20971520",
+    "MAX_DECOMPRESSED_BYTES": "104857600",
+    "ALLOWED_BLOB_HOSTS": "",
+
+    "ENABLE_GRAPH_LABEL_LOOKUP": "false",
+    "ENABLE_PURVIEW_LOOKUP": "true",
+    "ENABLE_ATLAS_LOOKUP": "true",
+    "ENABLE_CONTENT_SAFETY": "true",
+    "ENABLE_PII_DETECTION": "true",
+    "LOG_RAW_CONTENT": "false",
+
+    "CONTENT_SAFETY_SEVERITY_THRESHOLD": "4",
+
+    "HTTP_TIMEOUT_SECONDS": "10",
+    "HTTP_MAX_RETRIES": "3",
+    "HTTP_BACKOFF_BASE_SECONDS": "0.5",
+
+    "PII_THRESHOLD_SSN": "0.80",
+    "PII_THRESHOLD_CREDIT_CARD": "0.80",
+    "PII_THRESHOLD_BANK_ACCOUNT": "0.80",
+    "PII_THRESHOLD_TAX_ID": "0.80",
+    "PII_THRESHOLD_PASSPORT": "0.80",
+    "PII_THRESHOLD_DRIVER_LICENSE": "0.80",
+    "PII_THRESHOLD_HEALTH_PLAN": "0.80",
+    "PII_THRESHOLD_EMAIL": "0.70",
+    "PII_THRESHOLD_PHONE": "0.70",
+    "PII_THRESHOLD_ADDRESS": "0.70",
+    "PII_THRESHOLD_PERSON": "0.75"
+  }
+}

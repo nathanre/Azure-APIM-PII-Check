@@ -1,0 +1,245 @@
+<!--
+  APIM policy: synchronous DLP / security inspection before the model backend.
+
+  Flow:
+    1. APIM builds an inspection request from the incoming call (prompt text,
+       user, source, metadata headers) and POSTs it to the inspection Function
+       at /api/evaluate.
+    2. The Function returns a decision object: action, classification, riskScore,
+       reasonCodes, findings, and (optionally) redactedText.
+    3. APIM enforces the decision:
+         - Block  -> return 403
+         - Review -> return 409 (route to a human-review queue if desired)
+         - Redact -> replace the prompt body with redactedText
+         - Allow / Warn -> forward to the model backend
+    4. APIM logs the correlationId and action (App Insights / Event Hub).
+
+  Named values required in APIM:
+    - inspection-function-url : full URL of the Function's /api/evaluate route
+    - inspection-function-key : the function key (store as a Key Vault secret)
+
+  Optional named values for the deterministic pre-check (see <inbound>):
+    - blocked-classifications : comma-separated labels that are blocked outright
+                               (default fallback: "HighlyConfidential,Regulated")
+    - precheck-block-regex    : regex that, if matched in the body, blocks the
+                               request before any downstream call is made
+                               (default fallback: US SSN pattern)
+    - enable-precheck         : "true" / "false" to toggle the pre-check gate
+                               (default fallback: "true")
+
+  The pre-check is a cheap, deterministic first layer (defense in depth). It is
+  intentionally coarse and only SHORT-CIRCUITS obvious blocks; it never allows a
+  request through on its own. The inspection Function remains the authoritative
+  decision (confidence scoring, Purview/label context, redaction, etc.).
+
+  NOTE: The inspection Function never calls the model backend and never stores
+  sensitive content. It always returns HTTP 200 with an actionable decision;
+  APIM owns the enforcement outcome.
+-->
+<policies>
+    <inbound>
+        <base />
+        <set-backend-service id="apim-generated-policy" backend-id="customer-test-ai-foundry-ai-endpoint" />
+        <llm-emit-token-metric>
+            <dimension name="Client IP address" value="@(context.Request.IpAddress)" />
+            <dimension name="User ID" />
+        </llm-emit-token-metric>
+        <llm-token-limit tokens-per-minute="1000" token-quota="5000" token-quota-period="Weekly" counter-key="@(context.Subscription.Id)" estimate-prompt-tokens="false" />
+        <set-variable name="correlationId" value="@(context.RequestId.ToString())" />
+        <!-- =====================================================================
+             DETERMINISTIC PRE-CHECK (runs BEFORE any downstream service call)
+             Cheap, header- and pattern-based gate. Blocks obvious cases without
+             a round-trip to the Function. Configurable via named values with
+             safe inline fallbacks so the policy works even if they are absent.
+             ===================================================================== -->
+        <set-variable name="precheckEnabled" value="@{
+            try { return "{{enable-precheck}}" != "false"; } catch { return true; }
+        }" />
+        <choose>
+            <when condition="@(context.Variables.GetValueOrDefault<bool>("precheckEnabled", true))">
+                <!-- 1) Blocked data-classification headers (exact, case-insensitive). -->
+                <set-variable name="blockedClassifications" value="@{
+                    var configured = "";
+                    try { configured = "{{blocked-classifications}}"; } catch { configured = ""; }
+                    if (string.IsNullOrWhiteSpace(configured)) { configured = "HighlyConfidential,Regulated"; }
+                    return configured;
+                }" />
+                <set-variable name="incomingClassification" value="@(context.Request.Headers.GetValueOrDefault("x-data-classification", context.Request.Headers.GetValueOrDefault("x-ms-sensitivity-label", "")))" />
+                <choose>
+                    <when condition="@{
+                        var label = context.Variables.GetValueOrDefault<string>("incomingClassification", "").Trim();
+                        if (string.IsNullOrEmpty(label)) { return false; }
+                        var blocked = context.Variables.GetValueOrDefault<string>("blockedClassifications", "")
+                            .Split(',').Select(s => s.Trim()).Where(s => s.Length > 0);
+                        return blocked.Any(b => string.Equals(b, label, StringComparison.OrdinalIgnoreCase));
+                    }">
+                        <return-response>
+                            <set-status code="403" reason="Forbidden" />
+                            <set-header name="Content-Type" exists-action="override">
+                                <value>application/json</value>
+                            </set-header>
+                            <set-body>@{
+                                return new JObject(
+                                    new JProperty("message", "Blocked by data-classification pre-check."),
+                                    new JProperty("correlationId", context.Variables.GetValueOrDefault<string>("correlationId")),
+                                    new JProperty("reasonCodes", new JArray("PRECHECK_CLASSIFICATION_BLOCKED")),
+                                    new JProperty("classification", context.Variables.GetValueOrDefault<string>("incomingClassification"))
+                                ).ToString();
+                            }</set-body>
+                        </return-response>
+                    </when>
+                </choose>
+                <!-- 2) Cheap regex pre-screen of the body for obvious patterns
+                        (e.g. US SSN). Only applied to text/JSON payloads. -->
+                <set-variable name="precheckRegex" value="@{
+                    var configured = "";
+                    try { configured = @"{{precheck-block-regex}}"; } catch { configured = ""; }
+                    if (string.IsNullOrWhiteSpace(configured)) { configured = @"\b\d{3}-\d{2}-\d{4}\b"; }
+                    return configured;
+                }" />
+                <choose>
+                    <when condition="@{
+                        var ct = context.Request.Headers.GetValueOrDefault("Content-Type", "");
+                        if (!(ct.Contains("json") || ct.Contains("text") || ct.Contains("x-www-form-urlencoded") || string.IsNullOrEmpty(ct))) { return false; }
+                        var body = context.Request.Body?.As<string>(preserveContent: true) ?? "";
+                        if (string.IsNullOrEmpty(body)) { return false; }
+                        var pattern = context.Variables.GetValueOrDefault<string>("precheckRegex", "");
+                        if (string.IsNullOrEmpty(pattern)) { return false; }
+                        try {
+                            return System.Text.RegularExpressions.Regex.IsMatch(
+                                body, pattern,
+                                System.Text.RegularExpressions.RegexOptions.IgnoreCase,
+                                TimeSpan.FromMilliseconds(100));
+                        } catch { return false; }
+                    }">
+                        <return-response>
+                            <set-status code="403" reason="Forbidden" />
+                            <set-header name="Content-Type" exists-action="override">
+                                <value>application/json</value>
+                            </set-header>
+                            <set-body>@{
+                                return new JObject(
+                                    new JProperty("message", "Blocked by pattern pre-check."),
+                                    new JProperty("correlationId", context.Variables.GetValueOrDefault<string>("correlationId")),
+                                    new JProperty("reasonCodes", new JArray("PRECHECK_PATTERN_BLOCKED"))
+                                ).ToString();
+                            }</set-body>
+                        </return-response>
+                    </when>
+                </choose>
+            </when>
+        </choose>
+        <!-- =====================================================================
+             AUTHORITATIVE INSPECTION (Function decides Allow/Warn/Redact/Block/Review)
+             ===================================================================== -->
+        <!-- Call the inspection Function. ignore-error=true so a transport
+             failure falls through to the fail-mode handling below. -->
+        <send-request mode="new" response-variable-name="inspection" timeout="20" ignore-error="true">
+            <set-url>{{inspection-function-url}}</set-url>
+            <set-method>POST</set-method>
+            <set-header name="x-functions-key" exists-action="override">
+                <value>{{inspection-function-key}}</value>
+            </set-header>
+            <set-header name="Content-Type" exists-action="override">
+                <value>application/json</value>
+            </set-header>
+            <set-body>@{
+                return new JObject(
+                    new JProperty("correlationId", context.Variables.GetValueOrDefault<string>("correlationId")),
+                    new JProperty("requestId", context.RequestId.ToString()),
+                    new JProperty("user", new JObject(
+                        new JProperty("id", context.User?.Id ?? ""),
+                        new JProperty("upn", context.User?.Email ?? ""),
+                        new JProperty("groups", new JArray(context.User?.Groups?.Select(g => g.Name) ?? new string[0])))),
+                    new JProperty("source", new JObject(
+                        new JProperty("application", context.Subscription?.Name ?? ""),
+                        new JProperty("apimSubscriptionId", context.Subscription?.Id ?? ""),
+                        new JProperty("operation", context.Operation?.Name ?? ""),
+                        new JProperty("requestPath", context.Request.Url.Path),
+                        new JProperty("model", context.Request.Headers.GetValueOrDefault("x-model", "")))),
+                    new JProperty("content", new JObject(
+                        new JProperty("type", "prompt"),
+                        new JProperty("text", context.Request.Body.As<string>(preserveContent: true)),
+                        new JProperty("blobUrl", context.Request.Headers.GetValueOrDefault("x-blob-url", "")),
+                        new JProperty("metadata", new JObject(
+                            new JProperty("x-data-classification", context.Request.Headers.GetValueOrDefault("x-data-classification", "")),
+                            new JProperty("x-ms-sensitivity-label", context.Request.Headers.GetValueOrDefault("x-ms-sensitivity-label", "")),
+                            new JProperty("x-purview-label-id", context.Request.Headers.GetValueOrDefault("x-purview-label-id", "")),
+                            new JProperty("qualifiedName", context.Request.Headers.GetValueOrDefault("x-purview-qualified-name", "")),
+                            new JProperty("purviewGuid", context.Request.Headers.GetValueOrDefault("x-purview-guid", "")))))),
+                    new JProperty("options", new JObject(
+                        new JProperty("returnRedactedText", true),
+                        new JProperty("lookupPurview", true),
+                        new JProperty("lookupAtlas", true),
+                        new JProperty("runContentSafety", true),
+                        new JProperty("runPiiDetection", true)))
+                ).ToString();
+            }</set-body>
+        </send-request>
+        <!-- Parse the decision. If the call failed, decision will be null. -->
+        <set-variable name="decision" value="@{
+            var resp = (IResponse)context.Variables["inspection"];
+            if (resp == null || resp.StatusCode >= 400) { return new JObject(new JProperty("action", "Review")); }
+            return resp.Body.As<JObject>(preserveContent: true);
+        }" />
+        <set-variable name="action" value="@(((JObject)context.Variables["decision"])["action"]?.ToString() ?? "Review")" />
+        <!-- Audit log: correlationId + action. -->
+        <trace source="inspection" severity="information">
+            <message>@($"correlationId={context.Variables.GetValueOrDefault<string>("correlationId")} action={context.Variables.GetValueOrDefault<string>("action")}")</message>
+        </trace>
+        <choose>
+            <!-- Block -> 403 with reason codes. -->
+            <when condition="@(context.Variables.GetValueOrDefault<string>("action") == "Block")">
+                <return-response>
+                    <set-status code="403" reason="Forbidden" />
+                    <set-header name="Content-Type" exists-action="override">
+                        <value>application/json</value>
+                    </set-header>
+                    <set-body>@{
+                        var d = (JObject)context.Variables["decision"];
+                        return new JObject(
+                            new JProperty("message", "Request blocked by data protection policy."),
+                            new JProperty("correlationId", d["correlationId"]),
+                            new JProperty("reasonCodes", d["reasonCodes"])
+                        ).ToString();
+                    }</set-body>
+                </return-response>
+            </when>
+            <!-- Review -> 409 (hook a human-review workflow here if desired). -->
+            <when condition="@(context.Variables.GetValueOrDefault<string>("action") == "Review")">
+                <return-response>
+                    <set-status code="409" reason="Requires Review" />
+                    <set-header name="Content-Type" exists-action="override">
+                        <value>application/json</value>
+                    </set-header>
+                    <set-body>@{
+                        var d = (JObject)context.Variables["decision"];
+                        return new JObject(
+                            new JProperty("message", "Request requires manual review."),
+                            new JProperty("correlationId", d["correlationId"]),
+                            new JProperty("reasonCodes", d["reasonCodes"])
+                        ).ToString();
+                    }</set-body>
+                </return-response>
+            </when>
+            <!-- Redact -> replace the prompt body with the redacted text. -->
+            <when condition="@(context.Variables.GetValueOrDefault<string>("action") == "Redact" &amp;&amp; ((JObject)context.Variables["decision"])["redactedText"] != null &amp;&amp; ((JObject)context.Variables["decision"])["redactedText"].Type != JTokenType.Null)">
+                <set-body>@(((JObject)context.Variables["decision"])["redactedText"].ToString())</set-body>
+            </when>
+            <!-- Allow / Warn -> continue to the backend model unchanged. -->
+        </choose>
+        <!-- Propagate correlation id to the backend for end-to-end tracing. -->
+        <set-header name="x-correlation-id" exists-action="override">
+            <value>@(context.Variables.GetValueOrDefault<string>("correlationId"))</value>
+        </set-header>
+    </inbound>
+    <backend>
+        <base />
+    </backend>
+    <outbound>
+        <base />
+    </outbound>
+    <on-error>
+        <base />
+    </on-error>
+</policies>
